@@ -19,728 +19,822 @@
 // into the document. Because of this, normal closure rules
 // do not apply here.
 function wrapper(plugin_info) {
-	// Make sure that window.plugin exists. IITC defines it as a no-op function,
-	// and other plugins assume the same.
-	if (typeof window.plugin !== "function") window.plugin = function () {};
-
-	const KEY_SETTINGS = "plugin-drone-path-planner-settings";
-	const KEY_ROUTES = "plugin-drone-path-planner-routes"
-	const THEORETICAL_KEY_RANGE = 1250;
-
-	// Use own namespace for plugin
-	window.plugin.DronePathTravelPlanner = function () {};
-
-	const thisPlugin = window.plugin.DronePathTravelPlanner;
-
-	// Name of the IITC build for first-party plugins
-	plugin_info.buildName = "DronePathTravelPlanner";
-
-	// Datetime-derived version of the plugin
-	plugin_info.dateTimeVersion = "20190101000000";
-
-	// ID/name of the plugin
-	plugin_info.pluginId = "dronepathtravelplanner";
-
-	const TIMERS = {};
-	function createThrottledTimer(name, callback, ms) {
-		if (TIMERS[name]) clearTimeout(TIMERS[name]);
-
-		// throttle if there are several calls to the functions
-		TIMERS[name] = setTimeout(function () {
-			delete TIMERS[name];
-			if (typeof window.requestIdleCallback == "undefined") callback();
-			// and even now, wait for iddle
-			else
-				requestIdleCallback(
-					function () {
-						callback();
-					},
-					{ timeout: 2000 }
-				);
-		}, ms || 100);
-	}
-
-	let routePortals = {};
-	let savedRoutes = {};
-	window.portalDroneIndicator	= null;
-	window.portalDroneIndicatorKey = null;
-	droneLayer = null;
-	dGridLayerGroup = null;
-	let routeLayerGroup;
-	let routeLayers = {};
-	let lastPortalGuid = null;
-
-	let drawnCells = {};
-
-	map = window.map;
-	calculationMethods =
-	{
-		"500/16": {"radius": 500, "gridSize": 16},
-		"570/17": {"radius": 570, "gridSize": 17}
-	}
-
-	const defaultSettings = {
-		circleColor: "#800080",
-		circleWidth: 2,
-		gridColor: "#00FF00",
-		gridWidth: 2,
-		calculationMethod: "500/16",
-		portalHighlight: "#f228ef",
-		keyRange: false,
-		showOneWay: true,
-	};
-
-	let settings = defaultSettings;
-
-	function saveSettings() {
-		createThrottledTimer("saveSettings", function () {
-			localStorage[KEY_SETTINGS] = JSON.stringify(settings);
-		});
-		drawDroneRange(lastPortalGuid);
-	}
-
-	thisPlugin.loadSettings = function() {
-		const tmp = localStorage[KEY_SETTINGS];
-		try {
-			settings = JSON.parse(tmp);
-		} catch (e) {
-			// eslint-disable-line no-empty
-		}
-		if (!settings.circleWidth) {
-			settings.circleWidth = "2";
-		}
-		if (!settings.gridWidth) {
-			settings.gridWidth = "2";
-		}
-		if (!settings.portalHighlight) {
-			settings.portalHighlight ="#f228ef"
-		}
-		if (!"keyRange" in settings) {
-			settings.keyRange = false
-		}
-		if (!"showOneWay" in settings) {
-			settings.showOneWay = true
-		}
-	}
-
-	window.resetSettings = function() {
-		settings = JSON.parse(JSON.stringify(defaultSettings));
-		showSettingsDialog();
-	}
-
-	thisPlugin.saveRoutes = function() {
-		createThrottledTimer('saveRoutes', function () {
-			localStorage[KEY_ROUTES] = JSON.stringify({
-				currentRoute: routePortals,
-				savedRoutes: savedRoutes,
-			});
-		});
-	}
-
-	thisPlugin.loadRoutes = function() {
-		const tmp = JSON.parse(localStorage[KEY_ROUTES] || '{}');
-		routePortals = tmp.currentRoute || {};
-		savedRoutes = tmp.savedRoutes || {};
-	}
-
-	const d2r = Math.PI / 180.0;
-	const r2d = 180.0 / Math.PI;
-
-	if (!window.S2) {
-		(function () {
-		window.S2 = {};
-
-		function LatLngToXYZ(latLng) {
-			const phi = latLng.lat * d2r;
-			const theta = latLng.lng * d2r;
-			const cosphi = Math.cos(phi);
-
-			return [Math.cos(theta) * cosphi, Math.sin(theta) * cosphi, Math.sin(phi)];
-		}
-
-
-
-		function XYZToLatLng(xyz) {
-			const lat = Math.atan2(xyz[2], Math.sqrt(xyz[0] * xyz[0] + xyz[1] * xyz[1]));
-			const lng = Math.atan2(xyz[1], xyz[0]);
-
-			return {lat: lat * r2d, lng: lng * r2d};
-		}
-
-		function largestAbsComponent(xyz) {
-			const temp = [Math.abs(xyz[0]), Math.abs(xyz[1]), Math.abs(xyz[2])];
-
-			if (temp[0] > temp[1]) {
-				if (temp[0] > temp[2]) {
-					return 0;
-				}
-				return 2;
-			}
-
-			if (temp[1] > temp[2]) {
-				return 1;
-			}
-
-			return 2;
-		}
-
-		function faceXYZToUV(face,xyz) {
-			let u, v;
-
-			switch (face) {
-				case 0: u =	xyz[1] / xyz[0]; v =	xyz[2] / xyz[0]; break;
-				case 1: u = -xyz[0] / xyz[1]; v =	xyz[2] / xyz[1]; break;
-				case 2: u = -xyz[0] / xyz[2]; v = -xyz[1] / xyz[2]; break;
-				case 3: u =	xyz[2] / xyz[0]; v =	xyz[1] / xyz[0]; break;
-				case 4: u =	xyz[2] / xyz[1]; v = -xyz[0] / xyz[1]; break;
-				case 5: u = -xyz[1] / xyz[2]; v = -xyz[0] / xyz[2]; break;
-				default: throw {error: 'Invalid face'};
-			}
-
-			return [u,v];
-		}
-
-		function XYZToFaceUV(xyz) {
-			let face = largestAbsComponent(xyz);
-
-			if (xyz[face] < 0) {
-				face += 3;
-			}
-
-			const uv = faceXYZToUV(face, xyz);
-
-			return [face, uv];
-		}
-
-		function FaceUVToXYZ(face, uv) {
-			const u = uv[0];
-			const v = uv[1];
-
-			switch (face) {
-				case 0: return [1, u, v];
-				case 1: return [-u, 1, v];
-				case 2: return [-u,-v, 1];
-				case 3: return [-1,-v,-u];
-				case 4: return [v,-1,-u];
-				case 5: return [v, u,-1];
-				default: throw {error: 'Invalid face'};
-			}
-		}
-
-		function STToUV(st) {
-			const singleSTtoUV = function (st) {
-				if (st >= 0.5) {
-					return (1 / 3.0) * (4 * st * st - 1);
-				}
-				return (1 / 3.0) * (1 - (4 * (1 - st) * (1 - st)));
-
-			};
-
-			return [singleSTtoUV(st[0]), singleSTtoUV(st[1])];
-		}
-
-		function UVToST(uv) {
-			const singleUVtoST = function (uv) {
-				if (uv >= 0) {
-					return 0.5 * Math.sqrt (1 + 3 * uv);
-				}
-				return 1 - 0.5 * Math.sqrt (1 - 3 * uv);
-
-			};
-
-			return [singleUVtoST(uv[0]), singleUVtoST(uv[1])];
-		}
-
-		function STToIJ(st,order) {
-			const maxSize = 1 << order;
-
-			const singleSTtoIJ = function (st) {
-				const ij = Math.floor(st * maxSize);
-				return Math.max(0, Math.min(maxSize - 1, ij));
-			};
-
-			return [singleSTtoIJ(st[0]), singleSTtoIJ(st[1])];
-		}
-
-		function IJToST(ij,order,offsets) {
-			const maxSize = 1 << order;
-
-			return [
-				(ij[0] + offsets[0]) / maxSize,
-				(ij[1] + offsets[1]) / maxSize
-			];
-		}
-
-		// S2Cell class
-		S2.S2Cell = function () {};
-
-		//static method to construct
-		S2.S2Cell.FromLatLng = function (latLng, level) {
-			const xyz = LatLngToXYZ(latLng);
-			const faceuv = XYZToFaceUV(xyz);
-			const st = UVToST(faceuv[1]);
-			const ij = STToIJ(st,level);
-
-			return S2.S2Cell.FromFaceIJ(faceuv[0], ij, level);
-		};
-
-		S2.S2Cell.FromFaceIJ = function (face, ij, level) {
-			const cell = new S2.S2Cell();
-			cell.face = face;
-			cell.ij = ij;
-			cell.level = level;
-
-			return cell;
-		};
-
-		S2.S2Cell.prototype.toString = function () {
-			return 'F' + this.face + 'ij[' + this.ij[0] + ',' + this.ij[1] + ']@' + this.level;
-		};
-
-		S2.S2Cell.prototype.getLatLng = function () {
-			const st = IJToST(this.ij, this.level, [0.5, 0.5]);
-			const uv = STToUV(st);
-			const xyz = FaceUVToXYZ(this.face, uv);
-
-			return XYZToLatLng(xyz);
-		};
-
-		S2.S2Cell.prototype.getCornerLatLngs = function () {
-			const offsets = [
-				[0.0, 0.0],
-				[0.0, 1.0],
-				[1.0, 1.0],
-				[1.0, 0.0]
-			];
-
-			return offsets.map(offset => {
-				const st = IJToST(this.ij, this.level, offset);
-				const uv = STToUV(st);
-				const xyz = FaceUVToXYZ(this.face, uv);
-
-				return XYZToLatLng(xyz);
-			});
-		};
-
-		S2.S2Cell.prototype.getNeighbors = function (deltas) {
-
-			const fromFaceIJWrap = function (face,ij,level) {
-				const maxSize = 1 << level;
-				if (ij[0] >= 0 && ij[1] >= 0 && ij[0] < maxSize && ij[1] < maxSize) {
-					// no wrapping out of bounds
-					return S2.S2Cell.FromFaceIJ(face,ij,level);
-				}
-
-				// the new i,j are out of range.
-				// with the assumption that they're only a little past the borders we can just take the points as
-				// just beyond the cube face, project to XYZ, then re-create FaceUV from the XYZ vector
-				let st = IJToST(ij,level,[0.5, 0.5]);
-				let uv = STToUV(st);
-				let xyz = FaceUVToXYZ(face, uv);
-				const faceuv = XYZToFaceUV(xyz);
-				face = faceuv[0];
-				uv = faceuv[1];
-				st = UVToST(uv);
-				ij = STToIJ(st,level);
-				return S2.S2Cell.FromFaceIJ(face, ij, level);
-			};
-
-			const face = this.face;
-			const i = this.ij[0];
-			const j = this.ij[1];
-			const level = this.level;
-
-			if (!deltas) {
-				deltas = [
-					{a: -1, b: 0},
-					{a: 0, b: -1},
-					{a: 1, b: 0},
-					{a: 0, b: 1}
-				];
-			}
-			return deltas.map(function (values) {
-				return fromFaceIJWrap(face, [i + values.a, j + values.b], level);
-			});
-		};
-		})();
-	}
-
-	function getCellFaceMidpointLatLngs(corners) {
-		let midpoints = [];
-		corners[4] = corners[0];
-		for (let i=0; i < 4; i++) {
-			const mlat = (corners[i].lat + corners[i+1].lat) / 2
-			const mlng = (corners[i].lng + corners[i+1].lng) / 2
-			midpoints.push({"lat": mlat, "lng": mlng});
-		}
-		return midpoints;
-	}
-
-	function getCellFaceQuarterpointLatLngs(corners) {
-		let quarterpoints = [];
-		corners[4] = corners[0];
-		for (let i=0; i < 4; i++) {
-			const mlat = (corners[i].lat + corners[i+1].lat) / 2
-			const mlng = (corners[i].lng + corners[i+1].lng) / 2
-			const qlat1 = (corners[i].lat + mlat) / 2
-			const qlng1 = (corners[i].lng + mlng) / 2
-			const qlat2 = (mlat + corners[i+1].lat) / 2
-			const qlng2 = (mlng + corners[i+1].lng) / 2
-			quarterpoints.push({"lat": qlat1, "lng": qlng1});
-			quarterpoints.push({"lat": qlat2, "lng": qlng2});
-		}
-		return quarterpoints;
-	}
-
-	function initSvgIcon() {
-		L.DivIcon.SVGIcon = L.DivIcon.extend({
-			options: {
-				'className': 'svg-icon',
-				'iconAnchor': null, //defaults to [iconSize.x/2, iconSize.y] (point tip)
-				'iconSize': L.point(48, 48)
-			},
-			initialize: function (options) {
-				options = L.Util.setOptions(this, options);
-
-				//iconSize needs to be converted to a Point object if it is not passed as one
-				options.iconSize = L.point(options.iconSize);
-
-				if (!options.iconAnchor) {
-					options.iconAnchor = L.point(Number(options.iconSize.x) / 2, Number(options.iconSize.y));
-				} else {
-					options.iconAnchor = L.point(options.iconAnchor);
-				}
-			},
-
-			// https://github.com/tonekk/Leaflet-Extended-Div-Icon/blob/master/extended.divicon.js#L13
-			createIcon: function (oldIcon) {
-				let div = L.DivIcon.prototype.createIcon.call(this, oldIcon);
-
-				if (this.options.id) {
-					div.id = this.options.id;
-				}
-
-				if (this.options.style) {
-					for (let key in this.options.style) {
-						div.style[key] = this.options.style[key];
-					}
-				}
-				return div;
-			}
-		});
-
-		L.divIcon.svgIcon = function (options) {
-			return new L.DivIcon.SVGIcon(options);
-		};
-
-		L.Marker.SVGMarker = L.Marker.extend({
-			options: {
-				'iconFactory': L.divIcon.svgIcon,
-				'iconOptions': {}
-			},
-			initialize: function (latlng, options) {
-				options = L.Util.setOptions(this, options);
-				options.icon = options.iconFactory(options.iconOptions);
-				this._latlng = latlng;
-			},
-			onAdd: function (map) {
-				L.Marker.prototype.onAdd.call(this, map);
-			}
-		});
-
-		L.marker.svgMarker = function (latlng, options) {
-			return new L.Marker.SVGMarker(latlng, options);
-		};
-	}
-
-	// The entry point for this plugin.
-	function setup() {
-		thisPlugin.loadSettings();
-		thisPlugin.loadRoutes();
-
-		initSvgIcon();
-
-		window.addHook(
-			"portalSelected",
-			window.drawDroneRange
-		);
-
-		window.addHook('portalSelected', thisPlugin.addToPortalDetails);
-
-		droneLayer = L.layerGroup();
-		window.addLayerGroup('Drone Grid', droneLayer, true);
-		dGridLayerGroup = L.layerGroup();
-
-		routeLayerGroup = L.layerGroup();
-		window.addLayerGroup('Drone Route', routeLayerGroup, true);
-
-		const toolbox = document.getElementById("toolbox");
-
-		let buttonDrone = document.createElement("a");
-		buttonDrone.textContent = "Drone Grid Settings";
-		buttonDrone.title = "Configuration for Drone Path Plugin";
-		buttonDrone.addEventListener("click", showSettingsDialog);
-		toolbox.appendChild(buttonDrone);
-		buttonDrone = document.createElement("a");
-		buttonDrone.textContent = "Drone Grid Actions";
-		buttonDrone.title = "Actions for Drone Path Plugin";
-		buttonDrone.addEventListener("click", showActionsDialog);
-		toolbox.appendChild(buttonDrone);
-		thisPlugin.setupCSS();
-
-		thisPlugin.addAllMarkers();
-	}
-
-	thisPlugin.onPortalSelectedPending = false;
-	thisPlugin.addToPortalDetails = function () {
-		const portalDetails = document.getElementById('portaldetails');
-
-		if (window.selectedPortal == null) {
-			return;
-		}
-
-		if (!thisPlugin.onPortalSelectedPending) {
-			thisPlugin.onPortalSelectedPending = true;
-
-			setTimeout(function () {
-				thisPlugin.onPortalSelectedPending = false;
-
-				$(portalDetails).append(`<div id="droneButton" class="DroneButtons">Drone Route: <a class="droneRoute" accesskey="r" onclick="window.plugin.DronePathTravelPlanner.switchStarPortal('route');return false;" title="Add this portal to the current route [r]"><span></span></a></div>`);
-				thisPlugin.updateStarPortal();
-			}, 0);
-		}
-	}
-
-	thisPlugin.updateStarPortal = function () {
-		$('.droneRoute').removeClass('favorite');
-		const guid = window.selectedPortal;
-		if (routePortals[guid]) {
-			$('.droneRoute').addClass('favorite');
-		}
-	}
-
-	thisPlugin.switchStarPortal = function (type) {
-		const guid = window.selectedPortal;
-
-		if (routePortals[guid]) {
-			delete routePortals[guid];
-            starInLayer = routeLayers[guid+"C"];
-			routeLayerGroup.removeLayer(starInLayer);
-			delete routeLayers[guid+"C"];
-		} else {
-			const p = window.portals[guid];
-			const ll = p.getLatLng();
-			thisPlugin.addPortalToRoute(guid, ll.lat, ll.lng, p.options.data.title, type);
-		}
-		thisPlugin.updateStarPortal();
-		thisPlugin.saveRoutes();
-	}
-
-	thisPlugin.addPortalToRoute = function (guid, lat, lng, name, type) {
-		// Add pogo in the localStorage
-		const obj = {'guid': guid, 'lat': lat, 'lng': lng, 'name': name};
-
-		// prevent that it would trigger the missing portal detection if it's in our data
-		if (window.portals[guid]) {
-			obj.exists = true;
-		}
-
-		if (type == 'route') {
-			routePortals[guid] = obj;
-		}
-
-		//saveStorage();
-		thisPlugin.updateStarPortal();
-
-		thisPlugin.addStar(guid, lat, lng, name, type);
-
-	};
-
-	thisPlugin.addStar = function (guid, lat, lng, name, type) {
-		if (type === 'route') {
-			di = L.circle([lat, lng], 25,
-						{ fill: true, color: "#000000", weight: 10, interactive: false, id: 'routeC' + guid.replace('.', '') });
-			routeLayers[guid + 'C'] = di;
+    // Make sure that window.plugin exists. IITC defines it as a no-op function,
+    // and other plugins assume the same.
+    if (typeof window.plugin !== "function")
+        window.plugin = function () {};
+
+    const KEY_SETTINGS = "plugin-drone-path-planner-settings";
+    const KEY_ROUTES = "plugin-drone-path-planner-routes"
+        const THEORETICAL_KEY_RANGE = 1250;
+
+    // Use own namespace for plugin
+    window.plugin.DronePathTravelPlanner = function () {};
+
+    const thisPlugin = window.plugin.DronePathTravelPlanner;
+
+    // Name of the IITC build for first-party plugins
+    plugin_info.buildName = "DronePathTravelPlanner";
+
+    // Datetime-derived version of the plugin
+    plugin_info.dateTimeVersion = "20190101000000";
+
+    // ID/name of the plugin
+    plugin_info.pluginId = "dronepathtravelplanner";
+
+    const TIMERS = {};
+    function createThrottledTimer(name, callback, ms) {
+        if (TIMERS[name])
+            clearTimeout(TIMERS[name]);
+
+        // throttle if there are several calls to the functions
+        TIMERS[name] = setTimeout(function () {
+            delete TIMERS[name];
+            if (typeof window.requestIdleCallback == "undefined")
+                callback();
+            // and even now, wait for iddle
+            else
+                requestIdleCallback(
+                    function () {
+                    callback();
+                }, {
+                    timeout: 2000
+                });
+        }, ms || 100);
+    }
+
+    let routePortals = {};
+    let savedRoutes = {};
+    window.portalDroneIndicator = null;
+    window.portalDroneIndicatorKey = null;
+    droneLayer = null;
+    dGridLayerGroup = null;
+    let routeLayerGroup;
+    let routeLayers = {};
+    let lastPortalGuid = null;
+
+    let drawnCells = {};
+
+    map = window.map;
+    calculationMethods = {
+        "500/16": {
+            "radius": 500,
+            "gridSize": 16
+        },
+        "570/17": {
+            "radius": 570,
+            "gridSize": 17
+        }
+    }
+
+    const defaultSettings = {
+        circleColor: "#800080",
+        circleWidth: 2,
+        gridColor: "#00FF00",
+        gridWidth: 2,
+        calculationMethod: "500/16",
+        portalHighlight: "#f228ef",
+        keyRange: false,
+        showOneWay: true,
+    };
+
+    let settings = defaultSettings;
+
+    function saveSettings() {
+        createThrottledTimer("saveSettings", function () {
+            localStorage[KEY_SETTINGS] = JSON.stringify(settings);
+        });
+        drawDroneRange(lastPortalGuid);
+    }
+
+    thisPlugin.loadSettings = function () {
+        const tmp = localStorage[KEY_SETTINGS];
+        try {
+            settings = JSON.parse(tmp);
+        } catch (e) {
+            // eslint-disable-line no-empty
+        }
+        if (!settings.circleWidth) {
+            settings.circleWidth = "2";
+        }
+        if (!settings.gridWidth) {
+            settings.gridWidth = "2";
+        }
+        if (!settings.portalHighlight) {
+            settings.portalHighlight = "#f228ef"
+        }
+        if (!"keyRange" in settings) {
+            settings.keyRange = false
+        }
+        if (!"showOneWay" in settings) {
+            settings.showOneWay = true
+        }
+    }
+
+    window.resetSettings = function () {
+        settings = JSON.parse(JSON.stringify(defaultSettings));
+        showSettingsDialog();
+    }
+
+    thisPlugin.saveRoutes = function () {
+        createThrottledTimer('saveRoutes', function () {
+            localStorage[KEY_ROUTES] = JSON.stringify({
+                currentRoute: routePortals,
+                savedRoutes: savedRoutes,
+            });
+        });
+    }
+
+    thisPlugin.loadRoutes = function () {
+        const tmp = JSON.parse(localStorage[KEY_ROUTES] || '{}');
+        routePortals = tmp.currentRoute || {};
+        savedRoutes = tmp.savedRoutes || {};
+    }
+
+    const d2r = Math.PI / 180.0;
+    const r2d = 180.0 / Math.PI;
+
+    if (!window.S2) {
+        (function () {
+            window.S2 = {};
+
+            function LatLngToXYZ(latLng) {
+                const phi = latLng.lat * d2r;
+                const theta = latLng.lng * d2r;
+                const cosphi = Math.cos(phi);
+
+                return [Math.cos(theta) * cosphi, Math.sin(theta) * cosphi, Math.sin(phi)];
+            }
+
+            function XYZToLatLng(xyz) {
+                const lat = Math.atan2(xyz[2], Math.sqrt(xyz[0] * xyz[0] + xyz[1] * xyz[1]));
+                const lng = Math.atan2(xyz[1], xyz[0]);
+
+                return {
+                    lat: lat * r2d,
+                    lng: lng * r2d
+                };
+            }
+
+            function largestAbsComponent(xyz) {
+                const temp = [Math.abs(xyz[0]), Math.abs(xyz[1]), Math.abs(xyz[2])];
+
+                if (temp[0] > temp[1]) {
+                    if (temp[0] > temp[2]) {
+                        return 0;
+                    }
+                    return 2;
+                }
+
+                if (temp[1] > temp[2]) {
+                    return 1;
+                }
+
+                return 2;
+            }
+
+            function faceXYZToUV(face, xyz) {
+                let u,
+                v;
+
+                switch (face) {
+                case 0:
+                    u = xyz[1] / xyz[0];
+                    v = xyz[2] / xyz[0];
+                    break;
+                case 1:
+                    u = -xyz[0] / xyz[1];
+                    v = xyz[2] / xyz[1];
+                    break;
+                case 2:
+                    u = -xyz[0] / xyz[2];
+                    v = -xyz[1] / xyz[2];
+                    break;
+                case 3:
+                    u = xyz[2] / xyz[0];
+                    v = xyz[1] / xyz[0];
+                    break;
+                case 4:
+                    u = xyz[2] / xyz[1];
+                    v = -xyz[0] / xyz[1];
+                    break;
+                case 5:
+                    u = -xyz[1] / xyz[2];
+                    v = -xyz[0] / xyz[2];
+                    break;
+                default:
+                    throw {
+                        error: 'Invalid face'
+                    };
+                }
+
+                return [u, v];
+            }
+
+            function XYZToFaceUV(xyz) {
+                let face = largestAbsComponent(xyz);
+
+                if (xyz[face] < 0) {
+                    face += 3;
+                }
+
+                const uv = faceXYZToUV(face, xyz);
+
+                return [face, uv];
+            }
+
+            function FaceUVToXYZ(face, uv) {
+                const u = uv[0];
+                const v = uv[1];
+
+                switch (face) {
+                case 0:
+                    return [1, u, v];
+                case 1:
+                    return [-u, 1, v];
+                case 2:
+                    return [-u, -v, 1];
+                case 3:
+                    return [-1, -v, -u];
+                case 4:
+                    return [v, -1, -u];
+                case 5:
+                    return [v, u, -1];
+                default:
+                    throw {
+                        error: 'Invalid face'
+                    };
+                }
+            }
+
+            function STToUV(st) {
+                const singleSTtoUV = function (st) {
+                    if (st >= 0.5) {
+                        return (1 / 3.0) * (4 * st * st - 1);
+                    }
+                    return (1 / 3.0) * (1 - (4 * (1 - st) * (1 - st)));
+
+                };
+
+                return [singleSTtoUV(st[0]), singleSTtoUV(st[1])];
+            }
+
+            function UVToST(uv) {
+                const singleUVtoST = function (uv) {
+                    if (uv >= 0) {
+                        return 0.5 * Math.sqrt(1 + 3 * uv);
+                    }
+                    return 1 - 0.5 * Math.sqrt(1 - 3 * uv);
+
+                };
+
+                return [singleUVtoST(uv[0]), singleUVtoST(uv[1])];
+            }
+
+            function STToIJ(st, order) {
+                const maxSize = 1 << order;
+
+                const singleSTtoIJ = function (st) {
+                    const ij = Math.floor(st * maxSize);
+                    return Math.max(0, Math.min(maxSize - 1, ij));
+                };
+
+                return [singleSTtoIJ(st[0]), singleSTtoIJ(st[1])];
+            }
+
+            function IJToST(ij, order, offsets) {
+                const maxSize = 1 << order;
+
+                return [
+                    (ij[0] + offsets[0]) / maxSize,
+                    (ij[1] + offsets[1]) / maxSize
+                ];
+            }
+
+            // S2Cell class
+            S2.S2Cell = function () {};
+
+            //static method to construct
+            S2.S2Cell.FromLatLng = function (latLng, level) {
+                const xyz = LatLngToXYZ(latLng);
+                const faceuv = XYZToFaceUV(xyz);
+                const st = UVToST(faceuv[1]);
+                const ij = STToIJ(st, level);
+
+                return S2.S2Cell.FromFaceIJ(faceuv[0], ij, level);
+            };
+
+            S2.S2Cell.FromFaceIJ = function (face, ij, level) {
+                const cell = new S2.S2Cell();
+                cell.face = face;
+                cell.ij = ij;
+                cell.level = level;
+
+                return cell;
+            };
+
+            S2.S2Cell.prototype.toString = function () {
+                return 'F' + this.face + 'ij[' + this.ij[0] + ',' + this.ij[1] + ']@' + this.level;
+            };
+
+            S2.S2Cell.prototype.getLatLng = function () {
+                const st = IJToST(this.ij, this.level, [0.5, 0.5]);
+                const uv = STToUV(st);
+                const xyz = FaceUVToXYZ(this.face, uv);
+
+                return XYZToLatLng(xyz);
+            };
+
+            S2.S2Cell.prototype.getCornerLatLngs = function () {
+                const offsets = [
+                    [0.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                    [1.0, 0.0]
+                ];
+
+                return offsets.map(offset => {
+                    const st = IJToST(this.ij, this.level, offset);
+                    const uv = STToUV(st);
+                    const xyz = FaceUVToXYZ(this.face, uv);
+
+                    return XYZToLatLng(xyz);
+                });
+            };
+
+            S2.S2Cell.prototype.getNeighbors = function (deltas) {
+
+                const fromFaceIJWrap = function (face, ij, level) {
+                    const maxSize = 1 << level;
+                    if (ij[0] >= 0 && ij[1] >= 0 && ij[0] < maxSize && ij[1] < maxSize) {
+                        // no wrapping out of bounds
+                        return S2.S2Cell.FromFaceIJ(face, ij, level);
+                    }
+
+                    // the new i,j are out of range.
+                    // with the assumption that they're only a little past the borders we can just take the points as
+                    // just beyond the cube face, project to XYZ, then re-create FaceUV from the XYZ vector
+                    let st = IJToST(ij, level, [0.5, 0.5]);
+                    let uv = STToUV(st);
+                    let xyz = FaceUVToXYZ(face, uv);
+                    const faceuv = XYZToFaceUV(xyz);
+                    face = faceuv[0];
+                    uv = faceuv[1];
+                    st = UVToST(uv);
+                    ij = STToIJ(st, level);
+                    return S2.S2Cell.FromFaceIJ(face, ij, level);
+                };
+
+                const face = this.face;
+                const i = this.ij[0];
+                const j = this.ij[1];
+                const level = this.level;
+
+                if (!deltas) {
+                    deltas = [{
+                            a: -1,
+                            b: 0
+                        }, {
+                            a: 0,
+                            b: -1
+                        }, {
+                            a: 1,
+                            b: 0
+                        }, {
+                            a: 0,
+                            b: 1
+                        }
+                    ];
+                }
+                return deltas.map(function (values) {
+                    return fromFaceIJWrap(face, [i + values.a, j + values.b], level);
+                });
+            };
+        })();
+    }
+
+    function getCellFaceMidpointLatLngs(corners) {
+        let midpoints = [];
+        corners[4] = corners[0];
+        for (let i = 0; i < 4; i++) {
+            const mlat = (corners[i].lat + corners[i + 1].lat) / 2
+            const mlng = (corners[i].lng + corners[i + 1].lng) / 2
+            midpoints.push({
+                "lat": mlat,
+                "lng": mlng
+            });
+        }
+        return midpoints;
+    }
+
+    function getCellFaceQuarterpointLatLngs(corners) {
+        let quarterpoints = [];
+        corners[4] = corners[0];
+        for (let i = 0; i < 4; i++) {
+            const mlat = (corners[i].lat + corners[i + 1].lat) / 2
+            const mlng = (corners[i].lng + corners[i + 1].lng) / 2
+            const qlat1 = (corners[i].lat + mlat) / 2
+            const qlng1 = (corners[i].lng + mlng) / 2
+            const qlat2 = (mlat + corners[i + 1].lat) / 2
+            const qlng2 = (mlng + corners[i + 1].lng) / 2
+            quarterpoints.push({
+                "lat": qlat1,
+                "lng": qlng1
+            });
+            quarterpoints.push({
+                "lat": qlat2,
+                "lng": qlng2
+            });
+        }
+        return quarterpoints;
+    }
+
+    function initSvgIcon() {
+        L.DivIcon.SVGIcon = L.DivIcon.extend({
+            options: {
+                'className': 'svg-icon',
+                'iconAnchor': null, //defaults to [iconSize.x/2, iconSize.y] (point tip)
+                'iconSize': L.point(48, 48)
+            },
+            initialize: function (options) {
+                options = L.Util.setOptions(this, options);
+
+                //iconSize needs to be converted to a Point object if it is not passed as one
+                options.iconSize = L.point(options.iconSize);
+
+                if (!options.iconAnchor) {
+                    options.iconAnchor = L.point(Number(options.iconSize.x) / 2, Number(options.iconSize.y));
+                } else {
+                    options.iconAnchor = L.point(options.iconAnchor);
+                }
+            },
+
+            // https://github.com/tonekk/Leaflet-Extended-Div-Icon/blob/master/extended.divicon.js#L13
+            createIcon: function (oldIcon) {
+                let div = L.DivIcon.prototype.createIcon.call(this, oldIcon);
+
+                if (this.options.id) {
+                    div.id = this.options.id;
+                }
+
+                if (this.options.style) {
+                    for (let key in this.options.style) {
+                        div.style[key] = this.options.style[key];
+                    }
+                }
+                return div;
+            }
+        });
+
+        L.divIcon.svgIcon = function (options) {
+            return new L.DivIcon.SVGIcon(options);
+        };
+
+        L.Marker.SVGMarker = L.Marker.extend({
+            options: {
+                'iconFactory': L.divIcon.svgIcon,
+                'iconOptions': {}
+            },
+            initialize: function (latlng, options) {
+                options = L.Util.setOptions(this, options);
+                options.icon = options.iconFactory(options.iconOptions);
+                this._latlng = latlng;
+            },
+            onAdd: function (map) {
+                L.Marker.prototype.onAdd.call(this, map);
+            }
+        });
+
+        L.marker.svgMarker = function (latlng, options) {
+            return new L.Marker.SVGMarker(latlng, options);
+        };
+    }
+
+    // The entry point for this plugin.
+    function setup() {
+        thisPlugin.loadSettings();
+        thisPlugin.loadRoutes();
+
+        initSvgIcon();
+
+        window.addHook(
+            "portalSelected",
+            window.drawDroneRange);
+
+        window.addHook('portalSelected', thisPlugin.addToPortalDetails);
+
+        droneLayer = L.layerGroup();
+        window.addLayerGroup('Drone Grid', droneLayer, true);
+        dGridLayerGroup = L.layerGroup();
+
+        routeLayerGroup = L.layerGroup();
+        window.addLayerGroup('Drone Route', routeLayerGroup, true);
+
+        const toolbox = document.getElementById("toolbox");
+
+        let buttonDrone = document.createElement("a");
+        buttonDrone.textContent = "Drone Grid Settings";
+        buttonDrone.title = "Configuration for Drone Path Plugin";
+        buttonDrone.addEventListener("click", showSettingsDialog);
+        toolbox.appendChild(buttonDrone);
+        buttonDrone = document.createElement("a");
+        buttonDrone.textContent = "Drone Grid Actions";
+        buttonDrone.title = "Actions for Drone Path Plugin";
+        buttonDrone.addEventListener("click", showActionsDialog);
+        toolbox.appendChild(buttonDrone);
+        thisPlugin.setupCSS();
+
+        thisPlugin.addAllMarkers();
+        $('<style>').prop('type', 'text/css').html('.leaflet-control-drone-mark a\n{\n  background-size: contain;\n	background-image: url("data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiA/PjxzdmcgaGVpZ2h0PSIxNzkyIiB2aWV3Qm94PSIwIDAgMTc5MiAxNzkyIiB3aWR0aD0iMTc5MiIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBkPSJNMTE1MiA4OTZxMCAxMDYtNzUgMTgxdC0xODEgNzUtMTgxLTc1LTc1LTE4MSA3NS0xODEgMTgxLTc1IDE4MSA3NSA3NSAxODF6bS0yNTYtNTQ0cS0xNDggMC0yNzMgNzN0LTE5OCAxOTgtNzMgMjczIDczIDI3MyAxOTggMTk4IDI3MyA3MyAyNzMtNzMgMTk4LTE5OCA3My0yNzMtNzMtMjczLTE5OC0xOTgtMjczLTczem03NjggNTQ0cTAgMjA5LTEwMyAzODUuNXQtMjc5LjUgMjc5LjUtMzg1LjUgMTAzLTM4NS41LTEwMy0yNzkuNS0yNzkuNS0xMDMtMzg1LjUgMTAzLTM4NS41IDI3OS41LTI3OS41IDM4NS41LTEwMyAzODUuNSAxMDMgMjc5LjUgMjc5LjUgMTAzIDM4NS41eiIvPjwvc3ZnPg==");\n}\n.leaflet-control-drone-mark a.active\n{\n	background-color: #BBB;\n}\n.leaflet-control-drone-mark-tooltip\n{\n	background-color: rgba(255, 255, 255, 0.6);\n	display: none;\n	height: 24px;\n	left: 30px;\n	line-height: 24px;\n	margin-left: 15px;\n	margin-top: -12px;\n	padding: 0 10px;\n	position: absolute;\n	top: 50%;\n	white-space: nowrap;\n	width: auto;\n}\n.leaflet-control-drone-mark a.active .leaflet-control-drone-mark-tooltip\n{\n	display: block;\n}\n.leaflet-control-drone-mark-tooltip:before\n{\n	border-color: transparent rgba(255, 255, 255, 0.6);\n	border-style: solid;\n	border-width: 12px 12px 12px 0;\n	content: "";\n	display: block;\n	height: 0;\n	left: -12px;\n	position: absolute;\n	width: 0;\n}\n').appendTo('head');
+
+        var parent = $(".leaflet-top.leaflet-left", window.map.getContainer());
+        
+
+        var button = document.createElement("a");
+        button.className = "leaflet-bar-part";
+        button.addEventListener("click", thisPlugin.togglePortalInRoute, false);
+        button.title = 'Toggle current portal in route';
+
+        var tooltip = document.createElement("div");
+        tooltip.className = "leaflet-control-drone-mark-tooltip";
+        button.appendChild(tooltip);
+
+        var container = document.createElement("div");
+        container.className = "leaflet-control-drone-mark leaflet-bar leaflet-control";
+        container.appendChild(button);
+        parent.append(container);
+
+        /*thisPlugin.layerCount.button = button;
+        thisPlugin.layerCount.tooltip = tooltip;
+        thisPlugin.layerCount.container = container;*/
+    }
+
+    thisPlugin.togglePortalInRoute = function(ev) {
+        thisPlugin.switchStarPortal('route');
+    }
+
+    thisPlugin.onPortalSelectedPending = false;
+    thisPlugin.addToPortalDetails = function () {
+        const portalDetails = document.getElementById('portaldetails');
+
+        if (window.selectedPortal == null) {
+            return;
+        }
+
+        if (!thisPlugin.onPortalSelectedPending) {
+            thisPlugin.onPortalSelectedPending = true;
+
+            setTimeout(function () {
+                thisPlugin.onPortalSelectedPending = false;
+
+                $(portalDetails).append(`<div id="droneButton" class="DroneButtons">Drone Route: <a class="droneRoute" accesskey="r" onclick="window.plugin.DronePathTravelPlanner.switchStarPortal('route');return false;" title="Add this portal to the current route [r]"><span></span></a></div>`);
+                thisPlugin.updateStarPortal();
+            }, 0);
+        }
+    }
+
+    thisPlugin.updateStarPortal = function () {
+        $('.droneRoute').removeClass('favorite');
+        const guid = window.selectedPortal;
+        if (routePortals[guid]) {
+            $('.droneRoute').addClass('favorite');
+        }
+    }
+
+    thisPlugin.switchStarPortal = function (type) {
+        const guid = window.selectedPortal;
+
+        if (routePortals[guid]) {
+            delete routePortals[guid];
+            starInLayer = routeLayers[guid + "C"];
+            routeLayerGroup.removeLayer(starInLayer);
+            delete routeLayers[guid + "C"];
+        } else {
+            const p = window.portals[guid];
+            const ll = p.getLatLng();
+            thisPlugin.addPortalToRoute(guid, ll.lat, ll.lng, p.options.data.title, type);
+        }
+        thisPlugin.updateStarPortal();
+        thisPlugin.saveRoutes();
+    }
+
+    thisPlugin.addPortalToRoute = function (guid, lat, lng, name, type) {
+        // Add pogo in the localStorage
+        const obj = {
+            'guid': guid,
+            'lat': lat,
+            'lng': lng,
+            'name': name
+        };
+
+        // prevent that it would trigger the missing portal detection if it's in our data
+        if (window.portals[guid]) {
+            obj.exists = true;
+        }
+
+        if (type == 'route') {
+            routePortals[guid] = obj;
+        }
+
+        //saveStorage();
+        thisPlugin.updateStarPortal();
+
+        thisPlugin.addStar(guid, lat, lng, name, type);
+
+    };
+
+    thisPlugin.addStar = function (guid, lat, lng, name, type) {
+        if (type === 'route') {
+            di = L.circle([lat, lng], 25, {
+                fill: true,
+                color: "#000000",
+                weight: 10,
+                interactive: false,
+                id: 'routeC' + guid.replace('.', '')
+            });
+            routeLayers[guid + 'C'] = di;
             di.addTo(routeLayerGroup);
-		}
-	};
+        }
+    };
 
-	thisPlugin.addAllMarkers = function() {
+    thisPlugin.addAllMarkers = function () {
         console.log(routePortals);
-		for (let pid in routePortals) {
-			const item = routePortals[pid];
-			const lat = item.lat;
-			const lng = item.lng;
-			const guid = item.guid;
-			const name = item.name;
-			if (guid != null) {
-				thisPlugin.addStar(guid, lat, lng, name, "route");
-			}
-		}
-	};
+        for (let pid in routePortals) {
+            const item = routePortals[pid];
+            const lat = item.lat;
+            const lng = item.lng;
+            const guid = item.guid;
+            const name = item.name;
+            if (guid != null) {
+                thisPlugin.addStar(guid, lat, lng, name, "route");
+            }
+        }
+    };
 
-	thisPlugin.resetCurrentRoute = function(confirmReset=true) {
-		if (confirmReset) {
-			if (confirm('Current Route will be deleted. Are you sure?', '') == false) {
-				return;
-			}
-		}
-		for (let pid in routeLayers) {
-			try {
-				const starInLayer = routeLayers[pid];
-				routeLayerGroup.removeLayer(starInLayer);
-				delete routeLayers[pid];
-			}
-			catch(err) {
-				console.log(err);
-				console.log(pid);
-			}
-		}
-		routePortals = {};
-		thisPlugin.saveRoutes();
-	};
+    thisPlugin.resetCurrentRoute = function (confirmReset = true) {
+        if (confirmReset) {
+            if (confirm('Current Route will be deleted. Are you sure?', '') == false) {
+                return;
+            }
+        }
+        for (let pid in routeLayers) {
+            try {
+                const starInLayer = routeLayers[pid];
+                routeLayerGroup.removeLayer(starInLayer);
+                delete routeLayers[pid];
+            } catch (err) {
+                console.log(err);
+                console.log(pid);
+            }
+        }
+        routePortals = {};
+        thisPlugin.saveRoutes();
+    };
 
-	thisPlugin.saveCurrentRoute = function() {
-		const today  = new Date();
-		const routeName = prompt("Please provide a name for this route", "New Route " + today.toLocaleString());
-		const routeId = uuidv4();
-		const routeToSave = {
-			id: routeId,
-			name: routeName,
-			portals: routePortals
-		}
-		savedRoutes[routeId] = routeToSave;
-		thisPlugin.saveRoutes();
-	};
+    thisPlugin.saveCurrentRoute = function () {
+        const today = new Date();
+        const routeName = prompt("Please provide a name for this route", "New Route " + today.toLocaleString());
+        const routeId = uuidv4();
+        const routeToSave = {
+            id: routeId,
+            name: routeName,
+            portals: routePortals
+        }
+        savedRoutes[routeId] = routeToSave;
+        thisPlugin.saveRoutes();
+    };
 
-	function uuidv4() {
-		return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-			const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
-			return v.toString(16);
-		});
-	}
+    function uuidv4() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            const r = Math.random() * 16 | 0,
+            v = c == 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
 
-	thisPlugin.LoadManageRoute = function() {
-		let html = '<div class="routeManagerDiv">';
+    thisPlugin.LoadManageRoute = function () {
+        let html = '<div class="routeManagerDiv">';
 
-		if (Object.keys(savedRoutes).length > 0) {
-			html += '<div class="routeList" id="routeList">'
-			Object.keys(savedRoutes).forEach(function (rid){
-				html += thisPlugin.htmlConfig(rid);
-			});
-		} else {
-			html += '<p>No saved Routes.</p>';
-		}
+        if (Object.keys(savedRoutes).length > 0) {
+            html += '<div class="routeList" id="routeList">'
+            Object.keys(savedRoutes).forEach(function (rid) {
+                html += thisPlugin.htmlConfig(rid);
+            });
+        } else {
+            html += '<p>No saved Routes.</p>';
+        }
 
-		html += '</div><div><button class="importone" onclick="window.plugin.DronePathTravelPlanner.importOneRoute()">Import route</button><p></div>';
+        html += '</div><div><button class="importone" onclick="window.plugin.DronePathTravelPlanner.importOneRoute()">Import route</button><p></div>';
 
-		dialog({
-			title: 'Load/Manage Saved Routes',
-			html: '<div id="routeManager">'+html+'</div>',
-			dialogClass: 'ui-dialog-routemanager-main',
-			minWidth: 400,
-		});
-	}
+        dialog({
+            title: 'Load/Manage Saved Routes',
+            html: '<div id="routeManager">' + html + '</div>',
+            dialogClass: 'ui-dialog-routemanager-main',
+            minWidth: 400,
+        });
+    }
 
-	thisPlugin.htmlConfig = function(ID){
-		const name = savedRoutes[ID].name;
-		let html = '';
-		html += '<div class="routeList" data-layer="'+ID+'" id="rdelete'+ID+'">';
-		html += '<a class="btn delete" onclick="window.plugin.DronePathTravelPlanner.deleteRoute(\''+ID+'\');return false;" title="Delete this route.">X</a>';
-		html += '<a class="btn action" onclick="window.plugin.DronePathTravelPlanner.loadRoute(\''+ID+'\');return false;" title="Load this route.">'+ name +'</a>';
-		html += '<a class="btn exportone" onclick="window.plugin.DronePathTravelPlanner.exportOneRoute(\''+ID+'\');return false;" title="Exports this route to a JSON file.">Export</a>';
-		html += '</div>';
-		return html;
-	}
+    thisPlugin.htmlConfig = function (ID) {
+        const name = savedRoutes[ID].name;
+        let html = '';
+        html += '<div class="routeList" data-layer="' + ID + '" id="rdelete' + ID + '">';
+        html += '<a class="btn delete" onclick="window.plugin.DronePathTravelPlanner.deleteRoute(\'' + ID + '\');return false;" title="Delete this route.">X</a>';
+        html += '<a class="btn action" onclick="window.plugin.DronePathTravelPlanner.loadRoute(\'' + ID + '\');return false;" title="Load this route.">' + name + '</a>';
+        html += '<a class="btn exportone" onclick="window.plugin.DronePathTravelPlanner.exportOneRoute(\'' + ID + '\');return false;" title="Exports this route to a JSON file.">Export</a>';
+        html += '</div>';
+        return html;
+    }
 
-	thisPlugin.deleteRoute = function(guid) {
-		if (confirm('Are you sure you want to delete this route?', '')) {
-			delete savedRoutes[guid];
-			const rElem = document.getElementById('rdelete'+guid);
-			rElem.parentNode.removeChild(rElem);
-			thisPlugin.saveRoutes();
-		}
-	};
+    thisPlugin.deleteRoute = function (guid) {
+        if (confirm('Are you sure you want to delete this route?', '')) {
+            delete savedRoutes[guid];
+            const rElem = document.getElementById('rdelete' + guid);
+            rElem.parentNode.removeChild(rElem);
+            thisPlugin.saveRoutes();
+        }
+    };
 
-	thisPlugin.loadRoute = function(guid) {
-		if (Object.keys(routePortals).length > 0) {
-			if (!confirm('Loading this route will overwrite the currently displayed route, if it is not saved it will be lost. Are you sure?', '')) {
-				return false;
-			}
-		}
-		thisPlugin.resetCurrentRoute(false);
-		routePortals = savedRoutes[guid].portals;
-		thisPlugin.addAllMarkers();
-		thisPlugin.saveRoutes();
-	};
+    thisPlugin.loadRoute = function (guid) {
+        if (Object.keys(routePortals).length > 0) {
+            if (!confirm('Loading this route will overwrite the currently displayed route, if it is not saved it will be lost. Are you sure?', '')) {
+                return false;
+            }
+        }
+        thisPlugin.resetCurrentRoute(false);
+        routePortals = savedRoutes[guid].portals;
+        thisPlugin.addAllMarkers();
+        thisPlugin.saveRoutes();
+    };
 
-	thisPlugin.exportOneRoute = function(guid) {
-		const routeName = savedRoutes[guid].name;
-		thisPlugin.saveToFile(savedRoutes[guid], routeName + '-export.json');
-	};
+    thisPlugin.exportOneRoute = function (guid) {
+        const routeName = savedRoutes[guid].name;
+        thisPlugin.saveToFile(savedRoutes[guid], routeName + '-export.json');
+    };
 
-	thisPlugin.saveToFile = function(text, filename) {
-		if (typeof text != 'string') {
-			text = JSON.stringify(text);
-		}
+    thisPlugin.saveToFile = function (text, filename) {
+        if (typeof text != 'string') {
+            text = JSON.stringify(text);
+        }
 
-		if (typeof window.saveFile != 'undefined') {
-			window.saveFile(text, filename, 'application/json');
-			return;
-		}
-	};
+        if (typeof window.saveFile != 'undefined') {
+            window.saveFile(text, filename, 'application/json');
+            return;
+        }
+    };
 
-	thisPlugin.importOneRoute = function() {
-		thisPlugin.readFromFile(function (content) {
-			const route = JSON.parse(content);
-			if ("id" in route &&
-			    "name" in route &&
-				"portals" in route) {
+    thisPlugin.importOneRoute = function () {
+        thisPlugin.readFromFile(function (content) {
+            const route = JSON.parse(content);
+            if ("id" in route &&
+                "name" in route &&
+                "portals" in route) {
 
-				let valid = true;
-				Object.keys(route.portals).forEach(function (key){
-					const portal = route.portals[key];
-					if (!("guid" in portal &&
-						  "lat" in portal &&
-						  "lng" in portal &&
-						  "name" in portal)) {
-						valid = false;
-						return;
-					}
-				});
-				if (!valid) {
-					return alert("Invalid route file.");
-				}
+                let valid = true;
+                Object.keys(route.portals).forEach(function (key) {
+                    const portal = route.portals[key];
+                    if (!("guid" in portal &&
+                            "lat" in portal &&
+                            "lng" in portal &&
+                            "name" in portal)) {
+                        valid = false;
+                        return;
+                    }
+                });
+                if (!valid) {
+                    return alert("Invalid route file.");
+                }
 
-				const rid = uuidv4();
-				savedRoutes[rid] = {
-					id: rid,
-					name: route.name,
-					portals: route.portals
-				}
-				thisPlugin.saveRoutes();
-				const rld = document.getElementById("routeList");
-				const newRouteDiv = thisPlugin.htmlConfig(rid);
-				rld.insertAdjacentHTML('beforeend', newRouteDiv);
-			} else {
-				return alert("Invalid route file.");
-			}
-		});
-	};
+                const rid = uuidv4();
+                savedRoutes[rid] = {
+                    id: rid,
+                    name: route.name,
+                    portals: route.portals
+                }
+                thisPlugin.saveRoutes();
+                const rld = document.getElementById("routeList");
+                const newRouteDiv = thisPlugin.htmlConfig(rid);
+                rld.insertAdjacentHTML('beforeend', newRouteDiv);
+            } else {
+                return alert("Invalid route file.");
+            }
+        });
+    };
 
-	thisPlugin.readFromFile = function(callback) {
-		if (typeof L.FileListLoader != 'undefined') {
-			L.FileListLoader.loadFiles({accept: 'application/json'})
-				.on('load',function (e) {
-					callback(e.reader.result);
-				});
-			return;
-		}
-	};
+    thisPlugin.readFromFile = function (callback) {
+        if (typeof L.FileListLoader != 'undefined') {
+            L.FileListLoader.loadFiles({
+                accept: 'application/json'
+            })
+            .on('load', function (e) {
+                callback(e.reader.result);
+            });
+            return;
+        }
+    };
 
-	function showSettingsDialog() {
-		const html =
-					`<p><label for="colorCircleColor">Radius Circle Color</label><br><input type="color" id="colorCircleColor" /></p>
+    function showSettingsDialog() {
+        const html =
+            `<p><label for="colorCircleColor">Radius Circle Color</label><br><input type="color" id="colorCircleColor" /></p>
 					 <p><label for="textCircleWidth">Radius Circle Thickness</label><br><input type="text" id="textCircleWidth" /></p>
 					 <p><label for="colorGridColor">Grid Color</label><br><input type="color" id="colorGridColor" /></p>
 					 <p><label for="textGridWidth">Grid Line Thickness</label><br><input type="text" id="textGridWidth" /></p>
@@ -758,393 +852,425 @@ function wrapper(plugin_info) {
 					 <a onclick="window.resetSettings();return false;" title="Restores settings to default state">Reset to Defaults</a>
 					`;
 
-		const width = Math.min(screen.availWidth, 420);
-		const container = dialog({
-			id: "settings",
-			width: width + "px",
-			html: html,
-			title: "Drone Path Planner Settings",
-		});
+        const width = Math.min(screen.availWidth, 420);
+        const container = dialog({
+            id: "settings",
+            width: width + "px",
+            html: html,
+            title: "Drone Path Planner Settings",
+        });
 
-		const div = container[0];
+        const div = container[0];
 
-		const colorCircleColorPicker = div.querySelector("#colorCircleColor");
-		colorCircleColorPicker.value = settings.circleColor;
-		colorCircleColorPicker.addEventListener("change", (e) => {
-			settings.circleColor = colorCircleColorPicker.value;
-			saveSettings();
-		});
+        const colorCircleColorPicker = div.querySelector("#colorCircleColor");
+        colorCircleColorPicker.value = settings.circleColor;
+        colorCircleColorPicker.addEventListener("change", (e) => {
+            settings.circleColor = colorCircleColorPicker.value;
+            saveSettings();
+        });
 
-		const textCircleWidthStr = div.querySelector("#textCircleWidth");
-		textCircleWidthStr.value = settings.circleWidth;
-		textCircleWidthStr.addEventListener("change", (e) => {
-			settings.circleWidth = textCircleWidthStr.value;
-			saveSettings();
-		});
+        const textCircleWidthStr = div.querySelector("#textCircleWidth");
+        textCircleWidthStr.value = settings.circleWidth;
+        textCircleWidthStr.addEventListener("change", (e) => {
+            settings.circleWidth = textCircleWidthStr.value;
+            saveSettings();
+        });
 
-		const colorGridColorPicker = div.querySelector("#colorGridColor");
-		colorGridColorPicker.value = settings.gridColor;
-		colorGridColorPicker.addEventListener("change", (e) => {
-			settings.gridColor = colorGridColorPicker.value;
-			saveSettings();
-		});
+        const colorGridColorPicker = div.querySelector("#colorGridColor");
+        colorGridColorPicker.value = settings.gridColor;
+        colorGridColorPicker.addEventListener("change", (e) => {
+            settings.gridColor = colorGridColorPicker.value;
+            saveSettings();
+        });
 
-		const textGridWidthStr = div.querySelector("#textGridWidth");
-		textGridWidthStr.value = settings.gridWidth;
-		textGridWidthStr.addEventListener("change", (e) => {
-			settings.gridWidth = textGridWidthStr.value;
-			saveSettings();
-		});
+        const textGridWidthStr = div.querySelector("#textGridWidth");
+        textGridWidthStr.value = settings.gridWidth;
+        textGridWidthStr.addEventListener("change", (e) => {
+            settings.gridWidth = textGridWidthStr.value;
+            saveSettings();
+        });
 
-		const colorHighlightPicker = div.querySelector("#colorHighlight");
-		colorHighlightPicker.value = settings.portalHighlight;
-		colorHighlightPicker.addEventListener("change", (e) => {
-			settings.portalHighlight = colorHighlightPicker.value;
-			saveSettings();
-		});
+        const colorHighlightPicker = div.querySelector("#colorHighlight");
+        colorHighlightPicker.value = settings.portalHighlight;
+        colorHighlightPicker.addEventListener("change", (e) => {
+            settings.portalHighlight = colorHighlightPicker.value;
+            saveSettings();
+        });
 
-		const selectCalculationTypeOption = div.querySelector("#selectCalculationType");
-		selectCalculationTypeOption.value = settings.calculationMethod;
-		selectCalculationTypeOption.addEventListener("change", (e) => {
-			settings.calculationMethod = selectCalculationTypeOption.value;
-			saveSettings();
-		});
+        const selectCalculationTypeOption = div.querySelector("#selectCalculationType");
+        selectCalculationTypeOption.value = settings.calculationMethod;
+        selectCalculationTypeOption.addEventListener("change", (e) => {
+            settings.calculationMethod = selectCalculationTypeOption.value;
+            saveSettings();
+        });
 
-		const keyRangeCB = div.querySelector("#cbKeyRange");
-		keyRangeCB.checked = settings.keyRange;
-		keyRangeCB.addEventListener("change", (e) => {
-			settings.keyRange = keyRangeCB.checked;
-			saveSettings();
-		});
+        const keyRangeCB = div.querySelector("#cbKeyRange");
+        keyRangeCB.checked = settings.keyRange;
+        keyRangeCB.addEventListener("change", (e) => {
+            settings.keyRange = keyRangeCB.checked;
+            saveSettings();
+        });
 
-		const showOneWayCB = div.querySelector("#cbShowOneWay");
-		showOneWayCB.checked = settings.showOneWay;
-		showOneWayCB.addEventListener("change", (e) => {
-			settings.showOneWay = showOneWayCB.checked;
-			saveSettings();
-		});
-	};
+        const showOneWayCB = div.querySelector("#cbShowOneWay");
+        showOneWayCB.checked = settings.showOneWay;
+        showOneWayCB.addEventListener("change", (e) => {
+            settings.showOneWay = showOneWayCB.checked;
+            saveSettings();
+        });
+    };
 
-	function showActionsDialog() {
-		const content = `<div id="droneActionsBox">
+    function showActionsDialog() {
+        const content = `<div id="droneActionsBox">
 			<a onclick="window.plugin.DronePathTravelPlanner.resetCurrentRoute();return false;" title="Deletes all current route markers">Reset Current Route</a>
 			<a onclick="window.plugin.DronePathTravelPlanner.saveCurrentRoute();return false;" title="Save current route">Save Current Route</a>
 			<a onclick="window.plugin.DronePathTravelPlanner.LoadManageRoute();return false;" title="Load/Manage saved routes">Load/Manage Route</a>
 			</div>`;
 
-		const container = dialog({
-			html: content,
-			title: 'Drone Grid Actions'
-		});
-	};
+        const container = dialog({
+            html: content,
+            title: 'Drone Grid Actions'
+        });
+    };
 
+    window.drawDroneRange = function (guid) {
+        portalDroneIndicator = null;
+        portalDroneIndicatorKey = null;
+        dGridLayerGroup.clearLayers();
 
-	window.drawDroneRange = function (guid) {
-		portalDroneIndicator = null;
-		portalDroneIndicatorKey = null;
-		dGridLayerGroup.clearLayers();
+        if (guid) {
+            if (guid.selectedPortalGuid) {
+                lastPortalGuid = guid;
 
-		if (guid) {
-			if (guid.selectedPortalGuid) {
-				lastPortalGuid = guid;
+                p = window.portals[guid.selectedPortalGuid];
+                const calcMethod = calculationMethods[settings.calculationMethod];
+                if (p) {
+                    const coord = new LatLng(p._latlng.lat, p._latlng.lng);
+                    portalDroneIndicator = L.circle(coord, calcMethod["radius"], {
+                        fill: false,
+                        color: settings.circleColor,
+                        weight: settings.circleWidth,
+                        interactive: false
+                    })
+                        dGridLayerGroup.addLayer(portalDroneIndicator);
+                    if (settings.keyRange) {
+                        portalDroneIndicatorKey = L.circle(coord, THEORETICAL_KEY_RANGE, {
+                            fill: false,
+                            color: settings.circleColor,
+                            weight: settings.circleWidth,
+                            interactive: false
+                        })
+                            dGridLayerGroup.addLayer(portalDroneIndicatorKey);
+                    }
+                }
+                updateMapGrid(calcMethod["gridSize"]);
+            } else {
+                if (droneLayer.hasLayer(dGridLayerGroup)) {
+                    droneLayer.removeLayer(dGridLayerGroup);
+                }
+            }
+        }
+    };
 
-				p = window.portals[guid.selectedPortalGuid];
-				const calcMethod = calculationMethods[settings.calculationMethod];
-				if (p) {
-					const coord = new LatLng(p._latlng.lat, p._latlng.lng);
-					portalDroneIndicator = L.circle(coord, calcMethod["radius"],
-						{ fill: false, color: settings.circleColor, weight: settings.circleWidth, interactive: false }
-					)
-					dGridLayerGroup.addLayer(portalDroneIndicator);
-					if (settings.keyRange) {
-						portalDroneIndicatorKey = L.circle(coord, THEORETICAL_KEY_RANGE,
-						{ fill: false, color: settings.circleColor, weight: settings.circleWidth, interactive: false }
-					)
-						dGridLayerGroup.addLayer(portalDroneIndicatorKey);
-					}
-				}
-				updateMapGrid(calcMethod["gridSize"]);
-			} else {
-				if (droneLayer.hasLayer(dGridLayerGroup)) {
-					droneLayer.removeLayer(dGridLayerGroup);
-				}
-			}
-		}
-	};
+    setup.info = plugin_info; //add the script info data to the function as a property
+    // if IITC has already booted, immediately run the 'setup' function
+    if (window.iitcLoaded) {
+        setup();
+    } else {
+        if (!window.bootPlugins) {
+            window.bootPlugins = [];
+        }
+        window.bootPlugins.push(setup);
+    }
 
-	setup.info = plugin_info; //add the script info data to the function as a property
-	// if IITC has already booted, immediately run the 'setup' function
-	if (window.iitcLoaded) {
-		setup();
-		} else {
-			if (!window.bootPlugins) {
-				window.bootPlugins = [];
-			}
-		window.bootPlugins.push(setup);
-	}
+    function updateMapGrid(gridSize) {
+        if (!portalDroneIndicator) {
+            return;
+        }
 
+        const zoom = map.getZoom();
 
-	function updateMapGrid(gridSize) {
-		if (!portalDroneIndicator) {
-			return;
-		}
+        if (zoom > 8) {
+            const cellsToDraw = determineCellGridInRange(portalDroneIndicator.getLatLng(), gridSize);
+            drawnCells = cellsToDraw;
+            Object.keys(cellsToDraw).forEach(function (key) {
+                dGridLayerGroup.addLayer(drawCell(cellsToDraw[key], settings.gridColor, settings.gridWidth));
+            });
+            highlightPortalsInRange();
+            if (!droneLayer.hasLayer(dGridLayerGroup)) {
+                droneLayer.addLayer(dGridLayerGroup);
+            }
+        }
+    }
 
-		const zoom = map.getZoom();
+    function determineCellGridInRange(centerPoint, gridLevel) {
+        const seenCells = {};
+        const cellsToDraw = [];
+        const cellsInRange = {};
+        const cell = S2.S2Cell.FromLatLng(getLatLngPoint(centerPoint), gridLevel);
+        cellsToDraw.push(cell);
+        seenCells[cell.toString()] = true;
 
-		if (zoom > 8) {
-			const cellsToDraw = determineCellGridInRange(portalDroneIndicator.getLatLng(), gridSize);
-			drawnCells = cellsToDraw;
-			Object.keys(cellsToDraw).forEach(function (key){
-				dGridLayerGroup.addLayer(drawCell(cellsToDraw[key], settings.gridColor, settings.gridWidth));
-			});
-			highlightPortalsInRange();
-			if (!droneLayer.hasLayer(dGridLayerGroup)) {
-				droneLayer.addLayer(dGridLayerGroup);
-			}
-		}
-	}
+        let curCell;
+        while (cellsToDraw.length > 0) {
+            curCell = cellsToDraw.pop();
+            const neighbors = curCell.getNeighbors();
 
-	function determineCellGridInRange(centerPoint, gridLevel) {
-		const seenCells = {};
-		const cellsToDraw = [];
-		const cellsInRange = {};
-		const cell = S2.S2Cell.FromLatLng(getLatLngPoint(centerPoint), gridLevel);
-		cellsToDraw.push(cell);
-		seenCells[cell.toString()] = true;
+            for (let n = 0; n < neighbors.length; n++) {
+                const nStr = neighbors[n].toString();
+                if (isCellinRange(neighbors[n], centerPoint)) {
+                    if (!seenCells[nStr]) {
+                        seenCells[nStr] = true;
+                        cellsToDraw.push(neighbors[n]);
+                    }
+                }
+            }
 
-		let curCell;
-		while (cellsToDraw.length > 0) {
-			curCell = cellsToDraw.pop();
-			const neighbors = curCell.getNeighbors();
+            cellsInRange[curCell.toString()] = curCell;
+        }
+        return cellsInRange;
+    }
 
-			for (let n = 0; n < neighbors.length; n++) {
-				const nStr = neighbors[n].toString();
-				if (isCellinRange(neighbors[n], centerPoint)) {
-					if (!seenCells[nStr]) {
-						seenCells[nStr] = true;
-						cellsToDraw.push(neighbors[n]);
-					}
-				}
-			}
+    function drawCell(cell, color, weight, opacity = 90) {
+        const corners = cell.getCornerLatLngs();
 
-			cellsInRange[curCell.toString()] = curCell;
-		}
-		return cellsInRange;
-	}
+        // NOTE: we only draw two of the edges. as we draw all cells on screen, the other two edges will either be drawn
+        // from the other cell, or be off screen so we don't care
+        const region = L.polyline([corners[0], corners[1], corners[2], corners[3], corners[0]], {
+            fill: false,
+            color: color,
+            opacity: opacity,
+            weight: weight,
+            clickable: false,
+            interactive: false
+        });
 
-	function drawCell(cell, color, weight, opacity = 90) {
-		const corners = cell.getCornerLatLngs();
+        return region;
+    }
 
-		// NOTE: we only draw two of the edges. as we draw all cells on screen, the other two edges will either be drawn
-		// from the other cell, or be off screen so we don't care
-		const region = L.polyline([corners[0], corners[1], corners[2], corners[3], corners[0]], {fill: false, color: color, opacity: opacity, weight: weight, clickable: false, interactive: false});
+    function highlightPortalsInRange() {
+        const scale = portalMarkerScale();
+        //	 portal level		 0	1  2  3  4	5  6  7  8
+        const LEVEL_TO_WEIGHT = [2, 2, 2, 2, 2, 3, 3, 4, 4];
+        const LEVEL_TO_RADIUS = [7, 7, 7, 7, 8, 8, 9, 10, 11];
+        let portalsInRange = [];
 
-		return region;
-	}
+        Object.keys(window.portals).forEach(function (key) {
+            const portal = window.portals[key];
+            const portalLatLng = L.latLng(portal._latlng.lat, portal._latlng.lng);
+            const portalCell = S2.S2Cell.FromLatLng(getLatLngPoint(portalLatLng), calculationMethods[settings.calculationMethod]["gridSize"]);
+            if (portalCell.toString()in drawnCells) {
+                portalsInRange.push(portal);
+                const level = Math.floor(portal["options"]["level"] || 0);
+                const lvlWeight = LEVEL_TO_WEIGHT[level] * Math.sqrt(scale) + 1;
+                const lvlRadius = LEVEL_TO_RADIUS[level] * scale + 2;
+                dGridLayerGroup.addLayer(L.circleMarker(portalLatLng, {
+                        radius: lvlRadius,
+                        fill: true,
+                        color: settings.portalHighlight,
+                        weight: lvlWeight,
+                        interactive: false,
+                        clickable: false
+                    }));
+            }
+        });
+        drawnCells = {};
+        if (settings.showOneWay) {
+            highlightOneWayJumps(portalsInRange);
+        }
+    }
 
-	function highlightPortalsInRange() {
-		const scale = portalMarkerScale();
-		//	 portal level		 0	1  2  3  4	5  6  7  8
-		const LEVEL_TO_WEIGHT = [2, 2, 2, 2, 2, 3, 3, 4, 4];
-		const LEVEL_TO_RADIUS = [7, 7, 7, 7, 8, 8, 9,10,11];
-		let portalsInRange = [];
+    function highlightOneWayJumps(portalsInRange) {
+        const circlePoint = portalDroneIndicator.getLatLng();
+        const centerPointCell = S2.S2Cell.FromLatLng(getLatLngPoint(circlePoint), calculationMethods[settings.calculationMethod]["gridSize"]);
+        const searchLatLng = L.latLng(47.481489, -122.196868);
 
-		Object.keys(window.portals).forEach(function (key){
-			const portal = window.portals[key];
-			const portalLatLng = L.latLng(portal._latlng.lat, portal._latlng.lng);
-			const portalCell = S2.S2Cell.FromLatLng(getLatLngPoint(portalLatLng), calculationMethods[settings.calculationMethod]["gridSize"]);
-			if (portalCell.toString() in drawnCells) {
-				portalsInRange.push(portal);
-				const level = Math.floor(portal["options"]["level"]||0);
-				const lvlWeight = LEVEL_TO_WEIGHT[level] * Math.sqrt(scale) + 1;
-				const lvlRadius = LEVEL_TO_RADIUS[level] * scale + 2;
-				dGridLayerGroup.addLayer(L.circleMarker(portalLatLng, { radius: lvlRadius, fill: true, color: settings.portalHighlight, weight: lvlWeight, interactive: false, clickable: false }
-				));
-			}
-		});
-		drawnCells = {};
-		if (settings.showOneWay) {
-			highlightOneWayJumps(portalsInRange);
-		}
-	}
+        portalsInRange.forEach(portal => {
+            const portalPoint = new LatLng(portal._latlng.lat, portal._latlng.lng);
+            if (haversine(portalPoint.lat, portalPoint.lng, circlePoint.lat, circlePoint.lng) > calculationMethods[settings.calculationMethod]["radius"]) {
+                const cellRange = determineCellGridInRange(portalPoint, calculationMethods[settings.calculationMethod]["gridSize"]);
+                if (!(centerPointCell.toString()in cellRange)) {
+                    dGridLayerGroup.addLayer(L.circleMarker(portalPoint, {
+                            radius: 15,
+                            fill: true,
+                            color: 'red',
+                            weight: 5,
+                            interactive: false,
+                            clickable: false
+                        }));
+                }
+            }
+        });
+    }
 
-	function highlightOneWayJumps(portalsInRange) {
-		const circlePoint = portalDroneIndicator.getLatLng();
-		const centerPointCell = S2.S2Cell.FromLatLng(getLatLngPoint(circlePoint), calculationMethods[settings.calculationMethod]["gridSize"]);
-		const searchLatLng = L.latLng(47.481489,-122.196868);
+    function portalMarkerScale() {
+        const zoom = map.getZoom();
+        if (L.Browser.mobile)
+            return zoom >= 16 ? 1.5 : zoom >= 14 ? 1.2 : zoom >= 11 ? 1.0 : zoom >= 8 ? 0.65 : 0.5;
+        else
+            return zoom >= 14 ? 1 : zoom >= 11 ? 0.8 : zoom >= 8 ? 0.65 : 0.5;
+    }
 
-		portalsInRange.forEach(portal => {
-			const portalPoint = new LatLng(portal._latlng.lat, portal._latlng.lng);
-			if (haversine(portalPoint.lat, portalPoint.lng, circlePoint.lat, circlePoint.lng) > calculationMethods[settings.calculationMethod]["radius"]) {
-				const cellRange = determineCellGridInRange(portalPoint, calculationMethods[settings.calculationMethod]["gridSize"]);
-				if (!(centerPointCell.toString() in cellRange)) {
-					dGridLayerGroup.addLayer(L.circleMarker(portalPoint, { radius: 15, fill: true, color: 'red', weight: 5, interactive: false, clickable: false }));
-				}
-			}
-		});
-	}
+    function fillCell(cell, color, opacity) {
+        // corner points
+        const corners = cell.getCornerLatLngs();
 
-	function portalMarkerScale() {
-		const zoom = map.getZoom();
-		if (L.Browser.mobile)
-			return zoom >= 16 ? 1.5 : zoom >= 14 ? 1.2 : zoom >= 11 ? 1.0 : zoom >= 8 ? 0.65 : 0.5;
-		else
-			return zoom >= 14 ? 1 : zoom >= 11 ? 0.8 : zoom >= 8 ? 0.65 : 0.5;
-	}
+        const region = L.polygon(corners, {
+            color: color,
+            fillOpacity: opacity,
+            weight: 0,
+            clickable: false,
+            interactive: false
+        });
 
-	function fillCell(cell, color, opacity) {
-		// corner points
-		const corners = cell.getCornerLatLngs();
+        return region;
+    }
 
-		const region = L.polygon(corners, {color: color, fillOpacity: opacity, weight: 0, clickable: false, interactive: false});
+    function isCellinRange(cell, centerLatLng) {
+        const corners = cell.getCornerLatLngs();
+        for (let i = 0; i < corners.length; i++) {
+            if (haversine(corners[i].lat, corners[i].lng, centerLatLng.lat, centerLatLng.lng) < calculationMethods[settings.calculationMethod]["radius"]) {
+                return true;
+            }
+        }
+        const midpoints = getCellFaceMidpointLatLngs(corners);
+        for (let i = 0; i < midpoints.length; i++) {
+            if (haversine(midpoints[i].lat, midpoints[i].lng, centerLatLng.lat, centerLatLng.lng) < calculationMethods[settings.calculationMethod]["radius"]) {
+                return true;
+            }
+        }
+        const quarterpoints = getCellFaceQuarterpointLatLngs(corners);
+        for (let i = 0; i < quarterpoints.length; i++) {
+            if (haversine(quarterpoints[i].lat, quarterpoints[i].lng, centerLatLng.lat, centerLatLng.lng) < calculationMethods[settings.calculationMethod]["radius"]) {
+                return true;
+            }
+        }
+        return false;
+    };
 
-		return region;
-	}
+    function haversine(lat1, lon1, lat2, lon2) {
+        const R = 6371e3; // metres
+        const φ1 = lat1 * Math.PI / 180; // φ, λ in radians
+        const φ2 = lat2 * Math.PI / 180;
+        const Δφ = (lat2 - lat1) * Math.PI / 180;
+        const Δλ = (lon2 - lon1) * Math.PI / 180;
 
-	function isCellinRange(cell, centerLatLng) {
-		const corners = cell.getCornerLatLngs();
-		for (let i = 0; i < corners.length; i++) {
-			if (haversine(corners[i].lat, corners[i].lng, centerLatLng.lat, centerLatLng.lng) < calculationMethods[settings.calculationMethod]["radius"]) {
-				return true;
-			}
-		}
-		const midpoints = getCellFaceMidpointLatLngs(corners);
-		for (let i = 0; i < midpoints.length; i++) {
-			if (haversine(midpoints[i].lat, midpoints[i].lng, centerLatLng.lat, centerLatLng.lng) < calculationMethods[settings.calculationMethod]["radius"]) {
-				return true;
-			}
-		}
-		const quarterpoints = getCellFaceQuarterpointLatLngs(corners);
-		for (let i = 0; i < quarterpoints.length; i++) {
-			if (haversine(quarterpoints[i].lat, quarterpoints[i].lng, centerLatLng.lat, centerLatLng.lng) < calculationMethods[settings.calculationMethod]["radius"]) {
-				return true;
-			}
-		}
-		return false;
-	};
+        const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
-	function haversine(lat1, lon1, lat2, lon2) {
-		const R = 6371e3; // metres
-		const φ1 = lat1 * Math.PI/180; // φ, λ in radians
-		const φ2 = lat2 * Math.PI/180;
-		const Δφ = (lat2-lat1) * Math.PI/180;
-		const Δλ = (lon2-lon1) * Math.PI/180;
+        return R * c; // in metres
+    }
 
-		const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
-					Math.cos(φ1) * Math.cos(φ2) *
-					Math.sin(Δλ/2) * Math.sin(Δλ/2);
-		const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    function getLatLngPoint(data) {
+        const result = {
+            lat: typeof data.lat == 'function' ? data.lat() : data.lat,
+            lng: typeof data.lng == 'function' ? data.lng() : data.lng
+        };
 
-		return R * c; // in metres
-	}
+        return result;
+    }
 
-	function getLatLngPoint(data) {
-		const result = {
-			lat: typeof data.lat == 'function' ? data.lat() : data.lat,
-			lng: typeof data.lng == 'function' ? data.lng() : data.lng
-		};
+    /* @class LatLng
+     * @aka L.LatLng
+     *
+     * Represents a geographical point with a certain latitude and longitude.
+     *
+     * @example
+     *
+     * ```
+     * var latlng = L.latLng(50.5, 30.5);
+     * ```
+     *
+     * All Leaflet methods that accept LatLng objects also accept them in a simple Array form and simple object form (unless noted otherwise), so these lines are equivalent:
+     *
+     * ```
+     * map.panTo([50, 30]);
+     * map.panTo({lon: 30, lat: 50});
+     * map.panTo({lat: 50, lng: 30});
+     * map.panTo(L.latLng(50, 30));
+     * ```
+     *
+     * Note that `LatLng` does not inherit from Leaflet's `Class` object,
+     * which means new classes can't inherit from it, and new methods
+     * can't be added to it with the `include` function.
+     */
 
-		return result;
-	}
+    function LatLng(lat, lng, alt) {
+        if (isNaN(lat) || isNaN(lng)) {
+            throw new Error('Invalid LatLng object: (' + lat + ', ' + lng + ')');
+        }
 
-	/* @class LatLng
-	 * @aka L.LatLng
-	 *
-	 * Represents a geographical point with a certain latitude and longitude.
-	 *
-	 * @example
-	 *
-	 * ```
-	 * var latlng = L.latLng(50.5, 30.5);
-	 * ```
-	 *
-	 * All Leaflet methods that accept LatLng objects also accept them in a simple Array form and simple object form (unless noted otherwise), so these lines are equivalent:
-	 *
-	 * ```
-	 * map.panTo([50, 30]);
-	 * map.panTo({lon: 30, lat: 50});
-	 * map.panTo({lat: 50, lng: 30});
-	 * map.panTo(L.latLng(50, 30));
-	 * ```
-	 *
-	 * Note that `LatLng` does not inherit from Leaflet's `Class` object,
-	 * which means new classes can't inherit from it, and new methods
-	 * can't be added to it with the `include` function.
-	 */
+        // @property lat: Number
+        // Latitude in degrees
+        this.lat = +lat;
 
-	function LatLng(lat, lng, alt) {
-		if (isNaN(lat) || isNaN(lng)) {
-			throw new Error('Invalid LatLng object: (' + lat + ', ' + lng + ')');
-		}
+        // @property lng: Number
+        // Longitude in degrees
+        this.lng = +lng;
 
-		// @property lat: Number
-		// Latitude in degrees
-		this.lat = +lat;
+        // @property alt: Number
+        // Altitude in meters (optional)
+        if (alt !== undefined) {
+            this.alt = +alt;
+        }
+    }
 
-		// @property lng: Number
-		// Longitude in degrees
-		this.lng = +lng;
+    LatLng.prototype = {
+        // @method equals(otherLatLng: LatLng, maxMargin?: Number): Boolean
+        // Returns `true` if the given `LatLng` point is at the same position (within a small margin of error). The margin of error can be overridden by setting `maxMargin` to a small number.
+        equals: function (obj, maxMargin) {
+            if (!obj) {
+                return false;
+            }
 
-		// @property alt: Number
-		// Altitude in meters (optional)
-		if (alt !== undefined) {
-			this.alt = +alt;
-		}
-	}
+            obj = toLatLng(obj);
 
-	LatLng.prototype = {
-		// @method equals(otherLatLng: LatLng, maxMargin?: Number): Boolean
-		// Returns `true` if the given `LatLng` point is at the same position (within a small margin of error). The margin of error can be overridden by setting `maxMargin` to a small number.
-		equals: function (obj, maxMargin) {
-			if (!obj) { return false; }
+            var margin = Math.max(
+                    Math.abs(this.lat - obj.lat),
+                    Math.abs(this.lng - obj.lng));
 
-			obj = toLatLng(obj);
+            return margin <= (maxMargin === undefined ? 1.0E-9 : maxMargin);
+        },
 
-			var margin = Math.max(
-					Math.abs(this.lat - obj.lat),
-					Math.abs(this.lng - obj.lng));
+        // @method toString(): String
+        // Returns a string representation of the point (for debugging purposes).
+        toString: function (precision) {
+            return 'LatLng(' +
+            formatNum(this.lat, precision) + ', ' +
+            formatNum(this.lng, precision) + ')';
+        },
 
-			return margin <= (maxMargin === undefined ? 1.0E-9 : maxMargin);
-		},
+        // @method distanceTo(otherLatLng: LatLng): Number
+        // Returns the distance (in meters) to the given `LatLng` calculated using the [Spherical Law of Cosines](https://en.wikipedia.org/wiki/Spherical_law_of_cosines).
+        distanceTo: function (other) {
+            return Earth.distance(this, toLatLng(other));
+        },
 
-		// @method toString(): String
-		// Returns a string representation of the point (for debugging purposes).
-		toString: function (precision) {
-			return 'LatLng(' +
-					formatNum(this.lat, precision) + ', ' +
-					formatNum(this.lng, precision) + ')';
-		},
+        // @method wrap(): LatLng
+        // Returns a new `LatLng` object with the longitude wrapped so it's always between -180 and +180 degrees.
+        wrap: function () {
+            return Earth.wrapLatLng(this);
+        },
 
-		// @method distanceTo(otherLatLng: LatLng): Number
-		// Returns the distance (in meters) to the given `LatLng` calculated using the [Spherical Law of Cosines](https://en.wikipedia.org/wiki/Spherical_law_of_cosines).
-		distanceTo: function (other) {
-			return Earth.distance(this, toLatLng(other));
-		},
+        // @method toBounds(sizeInMeters: Number): LatLngBounds
+        // Returns a new `LatLngBounds` object in which each boundary is `sizeInMeters/2` meters apart from the `LatLng`.
+        toBounds: function (sizeInMeters) {
+            var latAccuracy = 180 * sizeInMeters / 40075017,
+            lngAccuracy = latAccuracy / Math.cos((Math.PI / 180) * this.lat);
 
-		// @method wrap(): LatLng
-		// Returns a new `LatLng` object with the longitude wrapped so it's always between -180 and +180 degrees.
-		wrap: function () {
-			return Earth.wrapLatLng(this);
-		},
+            return toLatLngBounds(
+                [this.lat - latAccuracy, this.lng - lngAccuracy],
+                [this.lat + latAccuracy, this.lng + lngAccuracy]);
+        },
 
-		// @method toBounds(sizeInMeters: Number): LatLngBounds
-		// Returns a new `LatLngBounds` object in which each boundary is `sizeInMeters/2` meters apart from the `LatLng`.
-		toBounds: function (sizeInMeters) {
-			var latAccuracy = 180 * sizeInMeters / 40075017,
-				lngAccuracy = latAccuracy / Math.cos((Math.PI / 180) * this.lat);
+        clone: function () {
+            return new LatLng(this.lat, this.lng, this.alt);
+        }
+    };
 
-			return toLatLngBounds(
-					[this.lat - latAccuracy, this.lng - lngAccuracy],
-					[this.lat + latAccuracy, this.lng + lngAccuracy]);
-		},
-
-		clone: function () {
-			return new LatLng(this.lat, this.lng, this.alt);
-		}
-	};
-
-	thisPlugin.setupCSS = function () {
-		$('<style>').prop('type', 'text/css').html(`
+    thisPlugin.setupCSS = function () {
+        $('<style>').prop('type', 'text/css').html(`
 		.droneRoute span {
 			display:inline-block;
 			float:left;
@@ -1271,27 +1397,26 @@ function wrapper(plugin_info) {
 			display:inline-block;
 		}
 		`).appendTo('head');
-	}
+    }
 }
 
-
 (function () {
-	const plugin_info = {};
-	if (typeof GM_info !== 'undefined' && GM_info && GM_info.script) {
-		plugin_info.script = {
-			version: GM_info.script.version,
-			name: GM_info.script.name,
-			description: GM_info.script.description
-		};
-	}
-	// Greasemonkey. It will be quite hard to debug
-	if (typeof unsafeWindow != 'undefined' || typeof GM_info == 'undefined' || GM_info.scriptHandler != 'Tampermonkey') {
-	// inject code into site context
-		const script = document.createElement('script');
-		script.appendChild(document.createTextNode('(' + wrapper + ')(' + JSON.stringify(plugin_info) + ');'));
-		(document.body || document.head || document.documentElement).appendChild(script);
-	} else {
-		// Tampermonkey, run code directly
-		wrapper(plugin_info);
-	}
+    const plugin_info = {};
+    if (typeof GM_info !== 'undefined' && GM_info && GM_info.script) {
+        plugin_info.script = {
+            version: GM_info.script.version,
+            name: GM_info.script.name,
+            description: GM_info.script.description
+        };
+    }
+    // Greasemonkey. It will be quite hard to debug
+    if (typeof unsafeWindow != 'undefined' || typeof GM_info == 'undefined' || GM_info.scriptHandler != 'Tampermonkey') {
+        // inject code into site context
+        const script = document.createElement('script');
+        script.appendChild(document.createTextNode('(' + wrapper + ')(' + JSON.stringify(plugin_info) + ');'));
+        (document.body || document.head || document.documentElement).appendChild(script);
+    } else {
+        // Tampermonkey, run code directly
+        wrapper(plugin_info);
+    }
 })();

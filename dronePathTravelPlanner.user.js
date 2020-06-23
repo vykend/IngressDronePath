@@ -2,7 +2,7 @@
 // @id dronePathTravelPlanner
 // @name IITC Plugin: Drone Travel Path Planner
 // @category Tweaks
-// @version 0.14.2b
+// @version 0.16.0b
 // @namespace	https://github.com/vykend/IngressDronePath
 // @downloadURL	https://github.com/vykend/IngressDronePath/raw/master/dronePathTravelPlanner.user.js
 // @homepageURL	https://github.com/vykend/IngressDronePath
